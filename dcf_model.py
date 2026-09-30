@@ -3,154 +3,137 @@ import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-class DCFModel:
-    def __init__(self, assumptions):
-        self.assumptions = assumptions
-        self.years = len(assumptions['rev_growth_rates'])
+class ValuationEngine:
+    def __init__(self, params):
+        self.p = params
+        self.horizon = len(params['growth_schedule'])
         
-    def calculate_wacc(self):
-        """Calculates Weighted Average Cost of Capital using CAPM."""
-        cost_of_equity = self.assumptions['risk_free_rate'] + self.assumptions['beta'] * (self.assumptions['market_return'] - self.assumptions['risk_free_rate'])
-        cost_of_debt_after_tax = self.assumptions['cost_of_debt'] * (1 - self.assumptions['tax_rate'])
+    def get_wacc(self):
+        # Determine cost of capital via CAPM framework and after-tax cost of debt
+        ke = self.p['rf'] + self.p['beta'] * (self.p['mrp'])
+        kd_after = self.p['cost_of_debt'] * (1 - self.p['tax_rate'])
         
-        wacc = (self.assumptions['weight_equity'] * cost_of_equity) + (self.assumptions['weight_debt'] * cost_of_debt_after_tax)
-        return wacc, cost_of_equity
+        wacc = (self.p['we'] * ke) + (self.p['wd'] * kd_after)
+        return wacc, ke
 
-    def project_cash_flows(self):
-        """Projects 5-year Unlevered Free Cash Flows (UFCF)."""
-        financials = pd.DataFrame(index=['Year 1', 'Year 2', 'Year 3', 'Year 4', 'Year 5'])
+    def build_schedule(self):
+        # Project 5-year operating metrics and unlevered free cash flows
+        df = pd.DataFrame(index=[f"Year {i}" for i in range(1, self.horizon + 1)])
         
-        # Revenue Projections
-        revenues = []
-        current_rev = self.assumptions['revenue_base']
-        for g in self.assumptions['rev_growth_rates']:
-            current_rev *= (1 + g)
-            revenues.append(current_rev)
+        rev_list = []
+        rev_tracking = self.p['base_revenue']
+        for g in self.p['growth_schedule']:
+            rev_tracking *= (1 + g)
+            rev_list.append(rev_tracking)
             
-        financials['Revenue'] = revenues
-        financials['EBIT'] = financials['Revenue'] * self.assumptions['ebit_margin']
-        financials['Taxes'] = financials['EBIT'] * self.assumptions['tax_rate']
-        financials['NOPAT'] = financials['EBIT'] - financials['Taxes']
+        df['Revenue'] = rev_list
+        df['EBIT'] = df['Revenue'] * self.p['operating_margin']
+        df['Tax'] = df['EBIT'] * self.p['tax_rate']
+        df['NOPAT'] = df['EBIT'] - df['Tax']
         
-        financials['D&A'] = financials['Revenue'] * self.assumptions['dna_margin']
-        financials['CapEx'] = financials['Revenue'] * self.assumptions['capex_margin']
+        df['DA'] = df['Revenue'] * self.p['da_pct']
+        df['CapEx'] = df['Revenue'] * self.p['capex_pct']
         
-        # Change in Net Working Capital
-        financials['NWC'] = financials['Revenue'] * self.assumptions['nwc_margin']
-        financials['Change in NWC'] = financials['NWC'].diff().fillna(financials['NWC'].iloc[0] - (self.assumptions['revenue_base'] * self.assumptions['nwc_margin']))
+        # Working capital adjustments
+        df['NWC'] = df['Revenue'] * self.p['nwc_pct']
+        df['Delta_NWC'] = df['NWC'].diff().fillna(df['NWC'].iloc[0] - (self.p['base_revenue'] * self.p['nwc_pct']))
         
-        # Unlevered Free Cash Flow (UFCF)
-        financials['UFCF'] = financials['NOPAT'] + financials['D&A'] - financials['CapEx'] - financials['Change in NWC']
-        
-        return financials
+        # Free cash flow generation
+        df['UFCF'] = df['NOPAT'] + df['DA'] - df['CapEx'] - df['Delta_NWC']
+        return df
 
-    def calculate_valuation(self, financials, wacc):
-        """Calculates Enterprise Value, Equity Value, and Implied Share Price."""
-        # Discount UFCF
-        discount_factors = [(1 + wacc) ** i for i in range(1, self.years + 1)]
-        financials['PV of UFCF'] = financials['UFCF'] / discount_factors
+    def compute_valuation(self, df, hurdle_rate):
+        # Discount future flows and calculate Enterprise to Equity bridge
+        discount_vec = [(1 + hurdle_rate) ** i for i in range(1, self.horizon + 1)]
+        df['PV_UFCF'] = df['UFCF'] / discount_vec
         
-        pv_of_ufcf_sum = financials['PV of UFCF'].sum()
+        sum_pv_ufcf = df['PV_UFCF'].sum()
         
-        # Terminal Value (Gordon Growth Method)
-        final_year_ufcf = financials['UFCF'].iloc[-1]
-        terminal_value = (final_year_ufcf * (1 + self.assumptions['terminal_growth_rate'])) / (wacc - self.assumptions['terminal_growth_rate'])
-        pv_of_terminal_value = terminal_value / ((1 + wacc) ** self.years)
+        # Terminal value via Gordon Growth
+        terminal_flow = df['UFCF'].iloc[-1]
+        terminal_val = (terminal_flow * (1 + self.p['perp_growth'])) / (hurdle_rate - self.p['perp_growth'])
+        pv_terminal = terminal_val / ((1 + hurdle_rate) ** self.horizon)
         
-        enterprise_value = pv_of_ufcf_sum + pv_of_terminal_value
-        equity_value = enterprise_value + self.assumptions['cash'] - self.assumptions['total_debt']
-        implied_share_price = equity_value / self.assumptions['shares_outstanding']
+        enterprise_val = sum_pv_ufcf + pv_terminal
+        equity_val = enterprise_val + self.p['cash_equivalents'] - self.p['total_debt']
+        share_price = equity_val / self.p['shares_out']
         
-        return enterprise_value, equity_value, implied_share_price
+        return enterprise_val, equity_val, share_price
 
-    def generate_sensitivity_matrix(self, base_wacc):
-        """Generates a sensitivity matrix of Implied Share Price (WACC vs. Terminal Growth)."""
-        wacc_range = np.linspace(base_wacc - 0.02, base_wacc + 0.02, 5)
-        tg_range = np.linspace(self.assumptions['terminal_growth_rate'] - 0.01, self.assumptions['terminal_growth_rate'] + 0.01, 5)
+    def sensitivity_grid(self, baseline_wacc):
+        # Stress test share price against varying WACC and terminal growth rates
+        wacc_spread = np.linspace(baseline_wacc - 0.02, baseline_wacc + 0.02, 5)
+        tg_spread = np.linspace(self.p['perp_growth'] - 0.01, self.p['perp_growth'] + 0.01, 5)
         
-        matrix = pd.DataFrame(index=[f"{w*100:.1f}%" for w in wacc_range], columns=[f"{t*100:.1f}%" for t in tg_range])
+        grid = pd.DataFrame(index=[f"{w*100:.1f}%" for w in wacc_spread], columns=[f"{t*100:.1f}%" for t in tg_spread])
         
-        for i, w in enumerate(wacc_range):
-            for j, t in enumerate(tg_range):
-                temp_assumptions = self.assumptions.copy()
-                temp_assumptions['terminal_growth_rate'] = t
+        for idx, w in enumerate(wacc_spread):
+            for col, t in enumerate(tg_spread):
+                df_temp = self.build_schedule()
+                last_ufcf = df_temp['UFCF'].iloc[-1]
                 
-                # Recalculate with temporary variables
-                financials = self.project_cash_flows()
-                final_year_ufcf = financials['UFCF'].iloc[-1]
+                pv_sum = sum([df_temp['UFCF'].iloc[k] / ((1 + w) ** (k + 1)) for k in range(self.horizon)])
+                tv = (last_ufcf * (1 + t)) / (w - t)
+                pv_tv = tv / ((1 + w) ** self.horizon)
                 
-                pv_of_ufcf_sum = sum([financials['UFCF'].iloc[k] / ((1 + w) ** (k + 1)) for k in range(self.years)])
-                tv = (final_year_ufcf * (1 + t)) / (w - t)
-                pv_tv = tv / ((1 + w) ** self.years)
+                ev = pv_sum + pv_tv
+                eq = ev + self.p['cash_equivalents'] - self.p['total_debt']
+                px = eq / self.p['shares_out']
                 
-                ev = pv_of_ufcf_sum + pv_tv
-                eq_val = ev + temp_assumptions['cash'] - temp_assumptions['total_debt']
-                price = eq_val / temp_assumptions['shares_outstanding']
+                grid.iloc[idx, col] = round(px, 2)
                 
-                matrix.iloc[i, j] = round(price, 2)
-                
-        matrix.index.name = "WACC"
-        matrix.columns.name = "Terminal Growth"
-        return matrix.astype(float)
+        grid.index.name = "WACC"
+        grid.columns.name = "Terminal Growth"
+        return grid.astype(float)
 
 if __name__ == "__main__":
-    # Baseline Corporate Assumptions (in millions where applicable)
     assumptions = {
-        # Operations
-        'revenue_base': 1000,
-        'rev_growth_rates': [0.10, 0.08, 0.06, 0.05, 0.04], # 5-year projections
-        'ebit_margin': 0.18,
+        'base_revenue': 1200,
+        'growth_schedule': [0.12, 0.09, 0.07, 0.05, 0.04],
+        'operating_margin': 0.20,
         'tax_rate': 0.21,
-        'dna_margin': 0.04,
-        'capex_margin': 0.05,
-        'nwc_margin': 0.10,
-        
-        # Capital Structure & CAPM
-        'risk_free_rate': 0.042,     # e.g., 10-year Treasury
-        'market_return': 0.10,       # Expected market return
-        'beta': 1.15,                # Industry levered beta
-        'cost_of_debt': 0.055,
-        'weight_equity': 0.75,
-        'weight_debt': 0.25,
-        
-        # Valuation Elements
-        'terminal_growth_rate': 0.025, # 2.5% perpetuity growth
-        'shares_outstanding': 100,     # millions
-        'cash': 150,
-        'total_debt': 300
+        'da_pct': 0.035,
+        'capex_pct': 0.045,
+        'nwc_pct': 0.08,
+        'rf': 0.042,
+        'mrp': 0.055,
+        'beta': 1.10,
+        'cost_of_debt': 0.06,
+        'we': 0.80,
+        'wd': 0.20,
+        'perp_growth': 0.025,
+        'shares_out': 120,
+        'cash_equivalents': 180,
+        'total_debt': 350
     }
 
-    model = DCFModel(assumptions)
+    engine = ValuationEngine(assumptions)
     
-    # 1. wacc
-    wacc, cost_of_equity = model.calculate_wacc()
-    print(f"--- Cost of Capital ---")
-    print(f"Cost of Equity (CAPM): {cost_of_equity*100:.2f}%")
+    wacc, cost_equity = engine.get_wacc()
+    print("=== COST OF CAPITAL ===")
+    print(f"Cost of Equity: {cost_equity*100:.2f}%")
     print(f"WACC: {wacc*100:.2f}%\n")
     
-    # 2. project cfs
-    financials = model.project_cash_flows()
-    print("--- 5-Year UFCF Projections ---")
-    print(financials[['Revenue', 'EBIT', 'UFCF']].round(2))
+    financial_schedule = engine.build_schedule()
+    print("=== PROJECTIONS ===")
+    print(financial_schedule[['Revenue', 'EBIT', 'UFCF']].round(2))
     print("\n")
     
-    # 3. valuation
-    ev, equity_value, share_price = model.calculate_valuation(financials, wacc)
-    print(f"--- Valuation Summary ---")
+    ev, eq_val, target_price = engine.compute_valuation(financial_schedule, wacc)
+    print("=== VALUATION OUTPUT ===")
     print(f"Enterprise Value: ${ev:,.2f}M")
-    print(f"Equity Value: ${equity_value:,.2f}M")
-    print(f"Implied Share Price: ${share_price:.2f}\n")
+    print(f"Equity Value: ${eq_val:,.2f}M")
+    print(f"Implied Price per Share: ${target_price:.2f}\n")
     
-    # 4. sensitivity
-    print("--- Sensitivity Analysis: Implied Share Price ---")
-    matrix = model.generate_sensitivity_matrix(wacc)
-    print(matrix)
+    sens_matrix = engine.sensitivity_grid(wacc)
+    print("=== SENSITIVITY TABLE ===")
+    print(sens_matrix)
 
     plt.figure(figsize=(8, 6))
-    sns.heatmap(matrix, annot=True, fmt=".2f", cmap="RdYlGn")
-    plt.title("Implied Share Price Sensitivity: WACC vs Terminal Growth")
+    sns.heatmap(sens_matrix, annot=True, fmt=".2f", cmap="Blues")
+    plt.title("Valuation Sensitivity: WACC vs Terminal Growth Rate")
     plt.xlabel("Terminal Growth Rate")
-    plt.ylabel("Weighted Average Cost of Capital (WACC)")
+    plt.ylabel("WACC")
     plt.tight_layout()
     plt.savefig("sensitivity_heatmap.png")
-    print("\nHeatmap saved as 'sensitivity_heatmap.png'")
+    print("\nSaved output plot as sensitivity_heatmap.png")
